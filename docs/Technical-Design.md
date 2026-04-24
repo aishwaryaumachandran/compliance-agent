@@ -29,11 +29,10 @@ A multi-agent system that ingests unstructured compliance-related inputs (docume
 | **Embeddings** | text-embedding-3-small | Sufficient for compliance knowledge base retrieval |
 | **Agent Framework** | **Microsoft Agent Framework (latest)** | Multi-agent orchestration, tool calling, structured output, human-in-the-loop patterns |
 | **Document Processing** | **Azure AI Content Understanding** *(optional)* | Unified multi-modal extraction from PDF/Word — text, tables, images, diagrams in a single pipeline. If not used, documents are parsed via GPT-5.2 vision directly. |
-| **Search / RAG** | Azure AI Search | Indexes compliance knowledge base (regulations, classification definitions, jurisdiction rules) |
 | **Storage** | Azure Blob Storage | Uploaded documents, knowledge base source files |
-| **State / Sessions** | Azure Cosmos DB | Chat history, session state, case drafts |
-| **Backend API** | .NET 8 ASP.NET Core (or Azure Functions) | Hosts agent endpoints, orchestration |
-| **Frontend** | Simple chat UI (React or Blazor) | File upload, chat, case draft display — minimal |
+| **Database** | Azure SQL Database | FAQ Q&A pairs (with vector search), sessions, case drafts, audit log |
+| **Backend API** | .NET 8 ASP.NET Core | Hosts agent endpoints, orchestration |
+| **Frontend** | Simple chat UI (Angular) | File upload, chat, case draft display — minimal |
 | **Monitoring** | Application Insights | Telemetry, prompt logging, latency tracking |
 
 ---
@@ -61,9 +60,9 @@ Two agents coordinated via Microsoft Agent Framework:
 │           ▼                          ▼                   │
 │  ┌─────────────────┐       ┌──────────────────────┐    │
 │  │     TOOLS       │       │       TOOLS           │    │
-│  │ - AI Search     │       │ - Content Understand. │    │
-│  │ - Session store │       │   (optional)          │    │
-│  │ - Off-topic     │       │ - Schema validator    │    │
+│  │ - SQL vector    │       │ - Content Understand. │    │
+│  │   search (FAQ)  │       │   (optional)          │    │
+│  │ - Session store │       │ - Schema validator    │    │
 │  │ - Off-topic     │       │ - Country validator   │    │
 │  │   detector      │       │ - Entity lookup       │    │
 │  └─────────────────┘       └──────────────────────┘    │
@@ -77,7 +76,7 @@ Two agents coordinated via Microsoft Agent Framework:
 | Responsibility | Detail |
 |---|---|
 | **Route intent** | Determine if user wants Q&A, document upload, or text-based case creation |
-| **RAG Q&A** | Query AI Search index for compliance knowledge; synthesize grounded answer via GPT-5.2 |
+| **RAG Q&A** | Query Azure SQL DB (FAQ vector search) for compliance knowledge; synthesize grounded answer via GPT-5.2 |
 | **Conversation management** | Multi-turn context, follow-up questions for missing fields, user confirmation |
 | **Guardrails** | Detect off-topic input; terminate with polite message |
 | **Invoke Extraction Agent** | Delegate document/text analysis to the Extraction Agent as a tool call |
@@ -111,7 +110,7 @@ Chat Agent
     │
     ├── Off-topic? ──▶ Terminate conversation
     │
-    ├── Query AI Search (compliance knowledge index)
+    ├── Query Azure SQL DB (FAQ vector search over compliance knowledge)
     │
     ├── GPT-5.2: Synthesize answer grounded in search results
     │
@@ -225,8 +224,8 @@ Extraction Agent prompt
 |---|---|
 | **Index source** | Regulatory directive text, classification definitions, jurisdiction-specific rules, internal compliance guidance |
 | **Chunking** | Semantic chunking by section/topic; ~500–800 tokens per chunk |
-| **Embeddings** | text-embedding-3-small → Azure AI Search vector index |
-| **Retrieval** | Hybrid search (vector + keyword) with semantic reranking |
+| **Embeddings** | text-embedding-3-small → stored as vectors in Azure SQL Database |
+| **Retrieval** | Vector search over FAQ Q&A pairs in Azure SQL Database |
 | **Grounding** | Search results injected into Chat Agent system prompt as context |
 
 ### 6.3 Classification Reasoning (Extraction Agent)
@@ -258,9 +257,9 @@ The Extraction Agent uses a structured prompt pattern for classification identif
 
 | Aspect | Design |
 |---|---|
-| **Chat history** | Stored in Cosmos DB, keyed by session ID |
+| **Chat history** | Stored in Azure SQL Database, keyed by session ID |
 | **Session lifecycle** | Created on first message; persists across tab close; cleared on logout |
-| **Case draft state** | Stored in Cosmos DB as a versioned JSON document (updated as user provides more info) |
+| **Case draft state** | Stored in Azure SQL Database as a versioned JSON record (updated as user provides more info) |
 | **Conversation context window** | Last N messages + current case draft state passed to agent on each turn |
 
 ### 6.6 Output Schema Validation
@@ -295,24 +294,21 @@ Resource Group: rg-compliance-agent
 ├── Azure AI Content Understanding (optional)
 │   └── Multi-modal document analyzer
 │
-├── Azure AI Search
-│   └── Index: compliance-knowledge-base
+├── Azure SQL Database
+│   ├── Table: faq-knowledge-base (with vector columns)
+│   ├── Table: sessions
+│   ├── Table: case-drafts
+│   └── Table: audit-log
 │
 ├── Azure Storage Account
 │   ├── Container: uploaded-documents
 │   └── Container: knowledge-base-source
 │
-├── Azure Cosmos DB (NoSQL)
-│   ├── Database: compliance-agent
-│   │   ├── Container: sessions
-│   │   ├── Container: case-drafts
-│   │   └── Container: audit-log
-│
-├── Azure App Service (or Azure Functions)
+├── Azure App Service
 │   └── .NET 8 backend + agent orchestration
 │
-├── Azure Static Web App (or App Service)
-│   └── Simple chat UI
+├── Azure Static Web App
+│   └── Simple chat UI (Angular)
 │
 └── Application Insights
     └── Telemetry + prompt logging
@@ -345,7 +341,7 @@ var chatAgent = AgentBuilder.Create("Compliance-Chat-Agent")
     .WithModel("gpt-5.2")
     .WithSystemPrompt(chatSystemPrompt)
     .WithTools(
-        aiSearchTool,           // RAG over compliance knowledge base
+        sqlVectorSearchTool,    // RAG over FAQ Q&A pairs in Azure SQL DB
         extractionAgentTool,    // Invoke Extraction Agent
         sessionStoreTool,       // Read/write session state
         offTopicDetectorTool    // Intent classification
@@ -390,7 +386,7 @@ while (!userConfirmed)
 
 // 5. Validate and finalize
 var finalDraft = await schemaValidator.Validate(result.Draft);
-await cosmosDb.SaveCaseDraft(finalDraft);
+await sqlDb.SaveCaseDraft(finalDraft);
 ```
 
 ---
@@ -404,13 +400,12 @@ Azure resources to provision before development begins:
 | 1 | Azure OpenAI Service | GPT-5.2 deployment (chat + vision) | Ensure sufficient TPM quota for dev/test |
 | 2 | Azure OpenAI Service | text-embedding-3-small deployment | For RAG indexing (matches current) |
 | 3 | Azure AI Content Understanding | Standard tier | **Optional** — multi-modal document analysis. Can start without it using GPT-5.2 vision directly. |
-| 4 | Azure AI Search | Basic or Standard tier | Vector search enabled |
+| 4 | Azure SQL Database | Standard tier | Vector search enabled, sessions, case drafts, audit log |
 | 5 | Azure Storage Account | Standard LRS | Two blob containers |
-| 6 | Azure Cosmos DB | Serverless (for dev) | NoSQL API |
-| 7 | Azure App Service | B1+ plan | .NET 8 runtime |
-| 8 | Application Insights | Standard | Connected to App Service |
-| 9 | Resource Group | `rg-compliance-agent` | All resources co-located |
-| 10 | Azure AD / Entra ID | App registration | Auth for API + managed identity for service-to-service |
+| 6 | Azure App Service | B1+ plan | .NET 8 runtime |
+| 7 | Application Insights | Standard | Connected to App Service |
+| 8 | Resource Group | `rg-compliance-agent` | All resources co-located |
+| 9 | Azure AD / Entra ID | App registration | Auth for API + managed identity for service-to-service |
 
 ---
 
@@ -421,7 +416,7 @@ Azure resources to provision before development begins:
 | D1 | **GPT-5.2 over GPT-4o-mini** | Stronger reasoning for compliance classification; better structured output compliance; native vision for document images |
 | D2 | **Two-agent architecture (Chat + Extraction)** | Separation of concerns: Chat handles UX/conversation, Extraction handles specialist compliance logic. |
 | D3 | **Azure AI Content Understanding for parsing (optional)** | Unified multi-modal pipeline for complex documents. Optional — simpler deployments can use GPT-5.2 vision directly. Add Content Understanding when document complexity warrants it. |
-| D4 | **Cosmos DB over in-memory cache** | Production-ready session persistence; survives restarts; supports multi-user concurrent access |
+| D4 | **Azure SQL Database over in-memory cache** | Production-ready session persistence; survives restarts; supports multi-user concurrent access; consolidates FAQ vector search, sessions, case drafts, and audit log in one service |
 | D5 | **Structured output mode** | GPT-5.2 structured output ensures JSON schema compliance at generation time, reducing post-processing failures |
-| D6 | **Hybrid RAG (vector + keyword)** | Catches both semantic matches (concept-level) and exact matches (classification codes, regulatory references) |
+| D6 | **SQL vector search for RAG** | FAQ Q&A pairs stored with vector embeddings in Azure SQL Database; avoids a separate search service; simpler architecture |
 | D7 | **Simple UI** | Unblocks agent development; can be replaced later |
