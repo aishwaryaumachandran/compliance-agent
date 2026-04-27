@@ -54,3 +54,7 @@ TestResult.xml
 nunit-*.xml
 
 /data
+
+appsettings.json
+appsettings.Development.json
+appsettings.Production.json
