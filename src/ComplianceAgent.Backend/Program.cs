@@ -47,11 +47,8 @@ var settingsPath = ResolveSettingsPath(SettingsFileName)
 var json = await File.ReadAllTextAsync(settingsPath);
 var settings = JsonSerializer.Deserialize<BackendSettings>(json, new JsonSerializerOptions
 {
-    options.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
-});
-builder.Services.AddSingleton<IMissingFieldService, MissingFieldService>();
-builder.Services.AddSingleton<IAiExtractionService, FoundryExtractionService>();
-builder.Services.AddSingleton<IFileTextExtractor, FileTextExtractor>();
+    PropertyNameCaseInsensitive = true
+}) ?? throw new InvalidOperationException("Could not parse appsettings.json.");
 
 if (string.IsNullOrWhiteSpace(settings.Foundry.Endpoint))
     throw new InvalidOperationException("Foundry:Endpoint is required in appsettings.json.");
@@ -113,184 +110,33 @@ else
 
 // --- Helpers ---
 
-public sealed class MdrDraft
+static string? ResolveSettingsPath(string fileName)
 {
-    public string? ArrangementId { get; set; }
-    public string? Country { get; set; }
-    public string? Description { get; set; }
-    public List<string> Entities { get; set; } = [];
-    public string Status { get; set; } = "draft";
-}
-
-public interface IMissingFieldService
-{
-    IReadOnlyList<string> GetMissingFields(MdrDraft draft);
-    string BuildQuestion(string fieldName);
-}
-
-public sealed class MissingFieldService : IMissingFieldService
-{
-    public IReadOnlyList<string> GetMissingFields(MdrDraft draft)
+    var candidates = new[]
     {
-        var missing = new List<string>();
-
-        if (string.IsNullOrWhiteSpace(draft.ArrangementId)) missing.Add(nameof(MdrDraft.ArrangementId));
-        if (string.IsNullOrWhiteSpace(draft.Country)) missing.Add(nameof(MdrDraft.Country));
-        if (string.IsNullOrWhiteSpace(draft.Description)) missing.Add(nameof(MdrDraft.Description));
-        if (draft.Entities.Count == 0) missing.Add(nameof(MdrDraft.Entities));
-
-        return missing;
-    }
-
-    public string BuildQuestion(string fieldName)
-    {
-        return fieldName switch
-        {
-            nameof(MdrDraft.ArrangementId) => "Can you provide the arrangement identifier? You can also skip this field.",
-            nameof(MdrDraft.Country) => "Can you provide the country related to this arrangement? You can also skip this field.",
-            nameof(MdrDraft.Description) => "Can you provide a short arrangement description? You can also skip this field.",
-            nameof(MdrDraft.Entities) => "Can you list the involved entities (comma-separated)? You can also skip this field.",
-            _ => $"Can you provide a value for {fieldName}? You can also skip this field."
-        };
-    }
-}
-
-public interface IAiExtractionService
-{
-    Task<MdrDraft> ExtractAsync(string inputText, MdrDraft? existingDraft, CancellationToken cancellationToken);
-}
-
-public sealed class FoundryExtractionService : IAiExtractionService
-{
-    private readonly FoundrySettings _settings;
-    private readonly ILogger<FoundryExtractionService> _logger;
-
-    public FoundryExtractionService(IConfiguration configuration, ILogger<FoundryExtractionService> logger)
-    {
-        _settings = configuration.GetSection("Foundry").Get<FoundrySettings>() ?? new FoundrySettings();
-        _logger = logger;
-    }
-
-    public async Task<MdrDraft> ExtractAsync(string inputText, MdrDraft? existingDraft, CancellationToken cancellationToken)
-    {
-        var fallback = existingDraft ?? new MdrDraft { Status = "draft" };
-
-        if (string.IsNullOrWhiteSpace(_settings.Endpoint) || string.IsNullOrWhiteSpace(_settings.Model))
-        {
-            _logger.LogWarning("Foundry configuration missing; returning empty extraction to avoid guessing.");
-            return fallback;
-        }
-
-        try
-        {
-            var projectClient = new AIProjectClient(new Uri(_settings.Endpoint), new DefaultAzureCredential());
-            var agent = projectClient.AsAIAgent(
-                model: _settings.Model,
-                name: _settings.AgentName,
-                instructions: "You extract MDR draft fields from user text. Never guess. Unknown fields must be null or empty arrays.");
-
-            var prompt = $$"""
-                Extract MDR draft fields from this text and return JSON only.
-
-                Rules:
-                - Extract only explicitly stated values.
-                - If a value is missing, set it to null (or [] for entities).
-                - Do not infer or invent values.
-                - Return ONLY valid JSON with this exact shape:
-                {
-                  "arrangementId": string|null,
-                  "country": string|null,
-                  "description": string|null,
-                  "entities": string[],
-                  "status": "draft"
-                }
-
-                Input:
-                {{inputText}}
-                """;
-
-            var response = await agent.RunAsync(prompt, cancellationToken: cancellationToken);
-            if (TryParseDraftFromResponse(response.Text, out var parsed) && parsed is not null)
-            {
-                return parsed;
-            }
-
-            _logger.LogWarning("Could not parse extraction response as JSON. Returning fallback draft.");
-            return fallback;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Extraction call failed; returning fallback draft.");
-            return fallback;
-        }
-    }
-
-    private static bool TryParseDraftFromResponse(string responseText, out MdrDraft? draft)
-    {
-        draft = null;
-        if (string.IsNullOrWhiteSpace(responseText))
-        {
-            return false;
-        }
-
-        var jsonText = responseText.Trim();
-        var match = Regex.Match(jsonText, "\\{[\\s\\S]*\\}");
-        if (match.Success)
-        {
-            jsonText = match.Value;
-        }
-
-        try
-        {
-            draft = JsonSerializer.Deserialize<MdrDraft>(jsonText, new JsonSerializerOptions
-            {
-                PropertyNameCaseInsensitive = true
-            });
-
-            if (draft is null)
-            {
-                return false;
-            }
-
-            draft.Entities ??= [];
-            draft.Status = "draft";
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-}
-
-public interface IFileTextExtractor
-{
-    Task<string> ExtractTextAsync(string filePath, string? contentType, CancellationToken cancellationToken);
-}
-
-public sealed class FileTextExtractor : IFileTextExtractor
-{
-    private static readonly HashSet<string> TextExtensions = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ".txt", ".md", ".json", ".csv", ".log", ".xml"
+        Path.Combine(Directory.GetCurrentDirectory(), fileName),
+        Path.Combine(Directory.GetCurrentDirectory(), "src", "ComplianceAgent.Backend", fileName),
+        Path.Combine(AppContext.BaseDirectory, fileName),
+        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", fileName))
     };
 
-    public async Task<string> ExtractTextAsync(string filePath, string? contentType, CancellationToken cancellationToken)
+    return candidates.FirstOrDefault(File.Exists);
+}
+
+static string? ResolveInputFilePath(string configuredPath, string settingsDirectory)
+{
+    if (Path.IsPathRooted(configuredPath))
     {
-        var extension = Path.GetExtension(filePath);
-        if (TextExtensions.Contains(extension))
-        {
-            return await File.ReadAllTextAsync(filePath, cancellationToken);
-        }
-
-        if (!string.IsNullOrWhiteSpace(contentType) && contentType.StartsWith("text/", StringComparison.OrdinalIgnoreCase))
-        {
-            return await File.ReadAllTextAsync(filePath, cancellationToken);
-        }
-
-        // Keep unsupported/binary formats empty so the system asks follow-up questions instead of guessing.
-        return string.Empty;
+        return File.Exists(configuredPath) ? configuredPath : null;
     }
+
+    var candidates = new[]
+    {
+        Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), configuredPath)),
+        Path.GetFullPath(Path.Combine(settingsDirectory, configuredPath))
+    };
+
+    return candidates.FirstOrDefault(File.Exists);
 }
 
 static string? ResolvePromptsDirectory()
@@ -325,30 +171,6 @@ static async Task<string> LoadPromptTextAsync(string fileName, string fallback)
 
 public class BackendSettings
 {
-    public static MdrDraft Merge(MdrDraft? current, MdrDraft? incoming)
-    {
-        var result = current is null
-            ? new MdrDraft()
-            : new MdrDraft
-            {
-                ArrangementId = current.ArrangementId,
-                Country = current.Country,
-                Description = current.Description,
-                Entities = [.. current.Entities],
-                Status = current.Status
-            };
-
-        if (incoming is null)
-        {
-            return result;
-        }
-
-        if (!string.IsNullOrWhiteSpace(incoming.ArrangementId)) result.ArrangementId = incoming.ArrangementId.Trim();
-        if (!string.IsNullOrWhiteSpace(incoming.Country)) result.Country = incoming.Country.Trim();
-        if (!string.IsNullOrWhiteSpace(incoming.Description)) result.Description = incoming.Description.Trim();
-        if (incoming.Entities.Count > 0) result.Entities = incoming.Entities.Where(e => !string.IsNullOrWhiteSpace(e)).Select(e => e.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        result.Status = "draft";
-
-        return result;
-    }
+    public FoundrySettings Foundry { get; set; } = new();
+    public string InputFile { get; set; } = "data\\Output.json";
 }
