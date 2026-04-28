@@ -1,6 +1,33 @@
 using System.Text.Json;
 using ComplianceAgent.Services;
 
+const string DefaultAgentInstructions = """
+You are a regulatory compliance extraction agent.
+
+Rules:
+- Read the uploaded document using Code Interpreter.
+- Return ONLY valid JSON.
+- Do not include markdown fences.
+- If a value is missing, set it to null (or [] for arrays).
+- Do not infer or invent values.
+""";
+
+const string DefaultExtractionPrompt = """
+Extract structured arrangement data from the uploaded file '{{input_file}}'.
+
+Return ONLY JSON using this exact shape:
+{
+    "arrangementId": null,
+    "country": null,
+    "entities": [],
+    "description": null,
+    "transactionType": null,
+    "status": "draft"
+}
+
+Do not add extra fields.
+""";
+
 // --- Parse CLI arguments ---
 string? fileInputArg = null;
 for (int i = 0; i < args.Length; i++)
@@ -39,12 +66,16 @@ var inputFile = ResolveInputFilePath(configuredInput, Path.GetDirectoryName(sett
 Console.WriteLine($"Processing: {Path.GetFileName(inputFile)}");
 
 // --- Load prompts ---
-var promptsDir = ResolvePromptsDirectory()
-    ?? throw new DirectoryNotFoundException("Could not find 'src/prompts' directory.");
-var agentInstructions = await File.ReadAllTextAsync(
-    Path.Combine(promptsDir, "ExtractionAgentInstructions.txt"));
-var extractionPrompt = await File.ReadAllTextAsync(
-    Path.Combine(promptsDir, "ExtractionPrompt.txt"));
+var agentInstructions = await LoadPromptTextAsync(
+    "ExtractionAgentInstructions.txt",
+    DefaultAgentInstructions);
+
+var extractionPromptTemplate = await LoadPromptTextAsync(
+    "ExtractionPrompt.txt",
+    DefaultExtractionPrompt);
+
+var extractionPrompt = extractionPromptTemplate.Replace("{{input_file}}", Path.GetFileName(inputFile));
+extractionPrompt = extractionPrompt.Replace("{{file_name}}", Path.GetFileName(inputFile));
 
 // --- Run extraction ---
 var foundrySettings = new FoundrySettings
@@ -113,11 +144,29 @@ static string? ResolvePromptsDirectory()
     var candidates = new[]
     {
         Path.Combine(Directory.GetCurrentDirectory(), "src", "prompts"),
+        Path.Combine(Directory.GetCurrentDirectory(), "src", "ComplianceAgent.Backend", "prompts"),
         Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "src", "prompts")),
+        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "src", "ComplianceAgent.Backend", "prompts")),
         Path.Combine(AppContext.BaseDirectory, "prompts")
     };
 
     return candidates.FirstOrDefault(Directory.Exists);
+}
+
+static async Task<string> LoadPromptTextAsync(string fileName, string fallback)
+{
+    var promptsDir = ResolvePromptsDirectory();
+    if (!string.IsNullOrWhiteSpace(promptsDir))
+    {
+        var filePath = Path.Combine(promptsDir, fileName);
+        if (File.Exists(filePath))
+        {
+            return await File.ReadAllTextAsync(filePath);
+        }
+    }
+
+    Console.WriteLine($"Prompt file '{fileName}' not found. Using built-in default template.");
+    return fallback;
 }
 
 public class BackendSettings
