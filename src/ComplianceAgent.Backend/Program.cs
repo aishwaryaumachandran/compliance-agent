@@ -1,17 +1,18 @@
-using System.Text;
 using System.Text.Json;
-using Azure.AI.Projects;
-using Azure.Identity;
-using Microsoft.Agents.AI;
-using Microsoft.Extensions.AI;
+using ComplianceAgent.Services;
 
-const string AgentInstructions = """
-    You are a compliance assistant.
-    Use the Code Interpreter tool to inspect file content and summarize key points.
-    """;
+// --- Parse CLI arguments ---
+string? fileInputArg = null;
+for (int i = 0; i < args.Length; i++)
+{
+    if (args[i] is "--file-input" && i + 1 < args.Length)
+    {
+        fileInputArg = args[++i];
+    }
+}
 
+// --- Load settings ---
 const string SettingsFileName = "appsettings.json";
-
 var settingsPath = ResolveSettingsPath(SettingsFileName)
     ?? throw new FileNotFoundException(
         $"Could not find '{SettingsFileName}'. Place it in repo root or in 'src\\ComplianceAgent.Backend'.");
@@ -26,65 +27,57 @@ if (string.IsNullOrWhiteSpace(settings.Foundry.Endpoint))
     throw new InvalidOperationException("Foundry:Endpoint is required in appsettings.json.");
 if (string.IsNullOrWhiteSpace(settings.Foundry.Model))
     throw new InvalidOperationException("Foundry:Model is required in appsettings.json.");
-if (string.IsNullOrWhiteSpace(settings.InputFile))
-    throw new InvalidOperationException("InputFile is required in appsettings.json.");
 
-var inputFile = ResolveInputFilePath(settings.InputFile, Path.GetDirectoryName(settingsPath)!)
-    ?? throw new FileNotFoundException($"Input file not found: {settings.InputFile}");
+// CLI --file-input overrides appsettings.json InputFile
+var configuredInput = fileInputArg ?? settings.InputFile;
+if (string.IsNullOrWhiteSpace(configuredInput))
+    throw new InvalidOperationException("No input file specified. Use --file-input <path> or set InputFile in appsettings.json.");
 
-var fileText = await File.ReadAllTextAsync(inputFile);
+var inputFile = ResolveInputFilePath(configuredInput, Path.GetDirectoryName(settingsPath)!)
+    ?? throw new FileNotFoundException($"Input file not found: {configuredInput}");
 
-AIProjectClient projectClient = new(
-    new Uri(settings.Foundry.Endpoint),
-    new DefaultAzureCredential());
+Console.WriteLine($"Processing: {Path.GetFileName(inputFile)}");
 
-AIAgent agent = projectClient.AsAIAgent(
-    model: settings.Foundry.Model,
-    name: settings.Foundry.AgentName,
-    instructions: AgentInstructions,
-    tools: [new HostedCodeInterpreterTool() { Inputs = [] }]);
+// --- Load prompts ---
+var promptsDir = ResolvePromptsDirectory()
+    ?? throw new DirectoryNotFoundException("Could not find 'src/prompts' directory.");
+var agentInstructions = await File.ReadAllTextAsync(
+    Path.Combine(promptsDir, "ExtractionAgentInstructions.txt"));
+var extractionPrompt = await File.ReadAllTextAsync(
+    Path.Combine(promptsDir, "ExtractionPrompt.txt"));
 
-string prompt = $$"""
-    Read this file content and provide a short summary:
-
-    File name: {{Path.GetFileName(inputFile)}}
-    ```
-    {{fileText}}
-    ```
-    """;
-
-AgentResponse response = await agent.RunAsync(prompt);
-
-Console.WriteLine("Assistant response:");
-Console.WriteLine(response.Text);
-
-CodeInterpreterToolCallContent? toolCall = response.Messages
-    .SelectMany(m => m.Contents)
-    .OfType<CodeInterpreterToolCallContent>()
-    .FirstOrDefault();
-
-if (toolCall?.Inputs is not null)
+// --- Run extraction ---
+var foundrySettings = new FoundrySettings
 {
-    DataContent? codeInput = toolCall.Inputs.OfType<DataContent>().FirstOrDefault();
-    if (codeInput?.HasTopLevelMediaType("text") ?? false)
-    {
-        Console.WriteLine();
-        Console.WriteLine("Code Interpreter input:");
-        Console.WriteLine(Encoding.UTF8.GetString(codeInput.Data.ToArray()));
-    }
-}
+    Endpoint = settings.Foundry.Endpoint,
+    Model = settings.Foundry.Model,
+    AgentName = settings.Foundry.AgentName
+};
 
-CodeInterpreterToolResultContent? toolResult = response.Messages
-    .SelectMany(m => m.Contents)
-    .OfType<CodeInterpreterToolResultContent>()
-    .FirstOrDefault();
+var extractionService = new ExtractionService(foundrySettings);
+var result = await extractionService.ExtractAsync(inputFile, agentInstructions, extractionPrompt);
 
-if (toolResult?.Outputs?.OfType<TextContent>().FirstOrDefault() is { } output)
+if (result.Success)
 {
+    var outputDir = Path.Combine(Directory.GetCurrentDirectory(), "extractedjson");
+    Directory.CreateDirectory(outputDir);
+    var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+    var outputFileName = $"{Path.GetFileNameWithoutExtension(inputFile)}_extracted_{timestamp}.json";
+    var outputPath = Path.Combine(outputDir, outputFileName);
+    await File.WriteAllTextAsync(outputPath, result.Json);
+
+    Console.WriteLine($"Extraction complete. Output saved to: {outputPath}");
     Console.WriteLine();
-    Console.WriteLine("Code Interpreter result:");
-    Console.WriteLine(output.Text);
+    Console.WriteLine(result.Json);
 }
+else
+{
+    Console.WriteLine($"Warning: {result.Error}");
+    Console.WriteLine("Raw output:");
+    Console.WriteLine(result.Json);
+}
+
+// --- Helpers ---
 
 static string? ResolveSettingsPath(string fileName)
 {
@@ -115,15 +108,20 @@ static string? ResolveInputFilePath(string configuredPath, string settingsDirect
     return candidates.FirstOrDefault(File.Exists);
 }
 
+static string? ResolvePromptsDirectory()
+{
+    var candidates = new[]
+    {
+        Path.Combine(Directory.GetCurrentDirectory(), "src", "prompts"),
+        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "src", "prompts")),
+        Path.Combine(AppContext.BaseDirectory, "prompts")
+    };
+
+    return candidates.FirstOrDefault(Directory.Exists);
+}
+
 public class BackendSettings
 {
     public FoundrySettings Foundry { get; set; } = new();
     public string InputFile { get; set; } = "data\\Output.json";
-}
-
-public class FoundrySettings
-{
-    public string Endpoint { get; set; } = string.Empty;
-    public string Model { get; set; } = "gpt-4o-mini";
-    public string AgentName { get; set; } = "compliance-agent-backend";
 }

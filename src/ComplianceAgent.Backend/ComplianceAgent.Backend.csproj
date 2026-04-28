@@ -9,11 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Azure.AI.Projects" Version="2.0.0" />
-    <PackageReference Include="Azure.Identity" Version="1.21.0" />
-    <PackageReference Include="Microsoft.Agents.AI" Version="1.3.0" />
-    <PackageReference Include="Microsoft.Agents.AI.Foundry" Version="1.3.0" />
-    <PackageReference Include="Microsoft.Extensions.AI" Version="10.5.0" />
+    <ProjectReference Include="..\ComplianceAgent.Services\ComplianceAgent.Services.csproj" />
   </ItemGroup>
 
 </Project>
