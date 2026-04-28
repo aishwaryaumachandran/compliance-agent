@@ -13,6 +13,7 @@ Minimal backend service under `src\ComplianceAgent.Backend` that builds MDR draf
 
 1. Copy `src\ComplianceAgent.Backend\appsettings.template.json` to `src\ComplianceAgent.Backend\appsettings.json`.
 2. Set `Foundry.Endpoint` and `Foundry.Model`.
+3. Optional: set `Foundry.PromptVersion` (default `v1`) to select the prompt template version.
 3. Optional: set `ConnectionStrings:Drafts` (or `Storage:ConnectionString`) to persist sessions/messages in Azure SQL.
 
 ## Run
@@ -31,6 +32,7 @@ The API exposes:
 6. `POST /draft/hold` (explicit hold state)
 7. `POST /draft/confirm` (final confirmation)
 8. `GET /draft/session/{sessionId}` (session state)
+9. `GET /prompt-library` (active prompt version + available versions)
 
 ## Unified Input Contract
 
@@ -61,6 +63,7 @@ Before clarification can continue, call `POST /draft/validate`:
 		"country": "Germany",
 		"description": "Optional correction",
 		"entities": ["Alpha GmbH", "Beta SARL"],
+		"transactionType": null,
 		"status": "draft"
 	}
 }
@@ -139,4 +142,12 @@ Use a custom API base URL:
 
 ```powershell
 .\scripts\manual_smoke.ps1 -BaseUrl "http://127.0.0.1:5190"
+```
+
+## Prompt Library Tests
+
+Run prompt-library and parser tests:
+
+```powershell
+dotnet test .\tests\ComplianceAgent.Backend.Tests\ComplianceAgent.Backend.Tests.csproj
 ```

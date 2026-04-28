@@ -17,6 +17,7 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 {
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
 });
+builder.Services.AddSingleton<IPromptLibrary, VersionedPromptLibrary>();
 builder.Services.AddSingleton<IMissingFieldService, MissingFieldService>();
 builder.Services.AddSingleton<IAiExtractionService, FoundryExtractionService>();
 builder.Services.AddSingleton<IFileTextExtractor, FileTextExtractor>();
@@ -37,6 +38,13 @@ else
 var app = builder.Build();
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+
+app.MapGet("/prompt-library", (IPromptLibrary promptLibrary) =>
+    Results.Ok(new
+    {
+        promptLibrary.ActiveVersion,
+        promptLibrary.AvailableVersions
+    }));
 
 app.MapGet("/draft/session/{sessionId}", async (
     string sessionId,
@@ -655,86 +663,83 @@ public interface IAiExtractionService
     Task<MdrDraft> ExtractAsync(string inputText, MdrDraft? existingDraft, CancellationToken cancellationToken);
 }
 
-public sealed class FoundryExtractionService : IAiExtractionService
+public interface IPromptLibrary
 {
-        private const string DraftSchemaJson = """
-                {
-                    "arrangementId": null,
-                    "country": null,
-                    "entities": [],
-                    "description": null,
-                    "transactionType": null,
-                    "status": "draft"
-                }
-                """;
+    string ActiveVersion { get; }
+    IReadOnlyList<string> AvailableVersions { get; }
+    PromptPackage BuildExtractionPrompt(string inputText);
+}
 
-        private const string ExtractionFewShot = """
-                Example Input:
-                "The company ABC GmbH entered a financing agreement in Germany."
+public sealed record PromptPackage(string Version, string Instructions, string Prompt);
 
-                Example Output:
-                {
-                    "arrangementId": null,
-                    "country": "Germany",
-                    "entities": ["ABC GmbH"],
-                    "description": "Financing agreement",
-                    "transactionType": null,
-                    "status": "draft"
-                }
-                """;
+public sealed class VersionedPromptLibrary : IPromptLibrary
+{
+    private const string DefaultVersion = "v1";
 
-    private readonly FoundrySettings _settings;
-    private readonly ILogger<FoundryExtractionService> _logger;
+    private static readonly IReadOnlyDictionary<string, Func<string, PromptPackage>> PromptBuilders
+        = new Dictionary<string, Func<string, PromptPackage>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["v1"] = BuildV1
+        };
 
-    public FoundryExtractionService(IConfiguration configuration, ILogger<FoundryExtractionService> logger)
+    public VersionedPromptLibrary(IConfiguration configuration)
     {
-        _settings = configuration.GetSection("Foundry").Get<FoundrySettings>() ?? new FoundrySettings();
-        _logger = logger;
+        var configuredVersion = configuration["Foundry:PromptVersion"];
+        ActiveVersion = string.IsNullOrWhiteSpace(configuredVersion)
+            ? DefaultVersion
+            : configuredVersion;
+
+        if (!PromptBuilders.ContainsKey(ActiveVersion))
+        {
+            ActiveVersion = DefaultVersion;
+        }
     }
 
-    public async Task<MdrDraft> ExtractAsync(string inputText, MdrDraft? existingDraft, CancellationToken cancellationToken)
+    public string ActiveVersion { get; private set; }
+
+    public IReadOnlyList<string> AvailableVersions { get; } = PromptBuilders.Keys.OrderBy(k => k).ToList();
+
+    public PromptPackage BuildExtractionPrompt(string inputText)
     {
-        var fallback = existingDraft ?? new MdrDraft { Status = "draft" };
+        var builder = PromptBuilders[ActiveVersion];
+        return builder(inputText);
+    }
 
-        if (string.IsNullOrWhiteSpace(_settings.Endpoint) || string.IsNullOrWhiteSpace(_settings.Model))
-        {
-            _logger.LogWarning("Foundry configuration missing; returning empty extraction to avoid guessing.");
-            return fallback;
-        }
+    private static PromptPackage BuildV1(string inputText)
+    {
+        const string instructions = """
+            You extract structured MDR arrangement draft data from unstructured input.
+            Accuracy is mandatory: never guess, infer, or invent missing values.
+            Always return JSON only and match the requested schema exactly.
+            """;
 
-        try
-        {
-            var projectClient = new AIProjectClient(new Uri(_settings.Endpoint), new DefaultAzureCredential());
-            var agent = projectClient.AsAIAgent(
-                model: _settings.Model,
-                name: _settings.AgentName,
-                instructions: """
-                    You extract structured MDR arrangement draft data from unstructured input.
-                    Accuracy is mandatory: never guess, infer, or invent missing values.
-                    Always return JSON only and match the requested schema exactly.
-                    """);
-
-            var prompt = BuildExtractionPrompt(inputText);
-
-            var response = await agent.RunAsync(prompt, cancellationToken: cancellationToken);
-            if (TryParseDraftFromResponse(response.Text, out var parsed) && parsed is not null)
+        const string draftSchemaJson = """
             {
-                return parsed;
+              "arrangementId": null,
+              "country": null,
+              "entities": [],
+              "description": null,
+              "transactionType": null,
+              "status": "draft"
             }
+            """;
 
-            _logger.LogWarning("Could not parse extraction response as JSON. Returning fallback draft.");
-            return fallback;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Extraction call failed; returning fallback draft.");
-            return fallback;
-        }
-    }
+        const string extractionFewShot = """
+            Example Input:
+            "The company ABC GmbH entered a financing agreement in Germany."
 
-    private static string BuildExtractionPrompt(string inputText)
-    {
-        return $$"""
+            Example Output:
+            {
+              "arrangementId": null,
+              "country": "Germany",
+              "entities": ["ABC GmbH"],
+              "description": "Financing agreement",
+              "transactionType": null,
+              "status": "draft"
+            }
+            """;
+
+        var prompt = $$"""
             You are an AI system that extracts structured MDR arrangement data from input text.
 
             Rules:
@@ -754,9 +759,9 @@ public sealed class FoundryExtractionService : IAiExtractionService
             - transactionType: Explicitly stated transaction type if present.
 
             Output JSON schema:
-            {{DraftSchemaJson}}
+            {{draftSchemaJson}}
 
-            {{ExtractionFewShot}}
+            {{extractionFewShot}}
 
             Input:
             <input>
@@ -766,9 +771,14 @@ public sealed class FoundryExtractionService : IAiExtractionService
             Return:
             Only valid JSON.
             """;
-    }
 
-    private static bool TryParseDraftFromResponse(string responseText, out MdrDraft? draft)
+        return new PromptPackage("v1", instructions, prompt);
+    }
+}
+
+public static class ExtractionResponseParser
+{
+    public static bool TryParseDraftFromResponse(string responseText, out MdrDraft? draft)
     {
         draft = null;
         if (string.IsNullOrWhiteSpace(responseText))
@@ -802,6 +812,60 @@ public sealed class FoundryExtractionService : IAiExtractionService
         catch
         {
             return false;
+        }
+    }
+}
+
+public sealed class FoundryExtractionService : IAiExtractionService
+{
+    private readonly FoundrySettings _settings;
+    private readonly ILogger<FoundryExtractionService> _logger;
+    private readonly IPromptLibrary _promptLibrary;
+
+    public FoundryExtractionService(
+        IConfiguration configuration,
+        ILogger<FoundryExtractionService> logger,
+        IPromptLibrary promptLibrary)
+    {
+        _settings = configuration.GetSection("Foundry").Get<FoundrySettings>() ?? new FoundrySettings();
+        _logger = logger;
+        _promptLibrary = promptLibrary;
+    }
+
+    public async Task<MdrDraft> ExtractAsync(string inputText, MdrDraft? existingDraft, CancellationToken cancellationToken)
+    {
+        var fallback = existingDraft ?? new MdrDraft { Status = "draft" };
+
+        if (string.IsNullOrWhiteSpace(_settings.Endpoint) || string.IsNullOrWhiteSpace(_settings.Model))
+        {
+            _logger.LogWarning("Foundry configuration missing; returning empty extraction to avoid guessing.");
+            return fallback;
+        }
+
+        try
+        {
+            var projectClient = new AIProjectClient(new Uri(_settings.Endpoint), new DefaultAzureCredential());
+            var promptPackage = _promptLibrary.BuildExtractionPrompt(inputText);
+            var agent = projectClient.AsAIAgent(
+                model: _settings.Model,
+                name: _settings.AgentName,
+                instructions: promptPackage.Instructions);
+
+            _logger.LogInformation("Using extraction prompt version {PromptVersion}", promptPackage.Version);
+
+            var response = await agent.RunAsync(promptPackage.Prompt, cancellationToken: cancellationToken);
+            if (ExtractionResponseParser.TryParseDraftFromResponse(response.Text, out var parsed) && parsed is not null)
+            {
+                return parsed;
+            }
+
+            _logger.LogWarning("Could not parse extraction response as JSON. Returning fallback draft.");
+            return fallback;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Extraction call failed; returning fallback draft.");
+            return fallback;
         }
     }
 }
@@ -1383,4 +1447,5 @@ public sealed class FoundrySettings
     public string Endpoint { get; set; } = string.Empty;
     public string Model { get; set; } = string.Empty;
     public string AgentName { get; set; } = "mdr-text-extraction-agent";
+    public string PromptVersion { get; set; } = "v1";
 }
