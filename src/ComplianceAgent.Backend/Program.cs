@@ -8,6 +8,7 @@ using Azure.Identity;
 using Microsoft.Agents.AI;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
+using UglyToad.PdfPig;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -776,6 +777,12 @@ public sealed class FileTextExtractor : IFileTextExtractor
             return await File.ReadAllTextAsync(filePath, cancellationToken);
         }
 
+        if (string.Equals(extension, ".pdf", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(contentType, "application/pdf", StringComparison.OrdinalIgnoreCase))
+        {
+            return await Task.Run(() => ExtractPdfText(filePath), cancellationToken);
+        }
+
         if (!string.IsNullOrWhiteSpace(contentType) && contentType.StartsWith("text/", StringComparison.OrdinalIgnoreCase))
         {
             return await File.ReadAllTextAsync(filePath, cancellationToken);
@@ -783,6 +790,23 @@ public sealed class FileTextExtractor : IFileTextExtractor
 
         // Keep unsupported/binary formats empty so the system asks follow-up questions instead of guessing.
         return string.Empty;
+    }
+
+    private static string ExtractPdfText(string filePath)
+    {
+        var sb = new StringBuilder();
+        using var pdf = PdfDocument.Open(filePath);
+        foreach (var page in pdf.GetPages())
+        {
+            var pageText = page.Text?.Trim();
+            if (!string.IsNullOrWhiteSpace(pageText))
+            {
+                sb.AppendLine(pageText);
+                sb.AppendLine();
+            }
+        }
+
+        return sb.ToString().Trim();
     }
 }
 
@@ -906,39 +930,93 @@ public sealed class SqlSessionStore : ISessionStore
                     SessionId NVARCHAR(64) NOT NULL PRIMARY KEY,
                     UserId NVARCHAR(128) NOT NULL,
                     Status NVARCHAR(32) NOT NULL,
-                    CompletionState NVARCHAR(32) NOT NULL,
-                    CurrentStep NVARCHAR(32) NOT NULL,
-                    InputMode NVARCHAR(16) NOT NULL,
-                    RequiresValidation BIT NOT NULL,
-                    SourceFileName NVARCHAR(260) NULL,
-                    SourceFileReference NVARCHAR(1024) NULL,
-                    PendingField NVARCHAR(64) NULL,
-                    DraftJson NVARCHAR(MAX) NOT NULL,
-                    SkippedFieldsJson NVARCHAR(MAX) NOT NULL,
                     CreatedAtUtc DATETIMEOFFSET NOT NULL,
                     UpdatedAtUtc DATETIMEOFFSET NOT NULL
                 );
             END;
 
-            IF COL_LENGTH('dbo.Sessions', 'InputMode') IS NULL
-                ALTER TABLE dbo.Sessions ADD InputMode NVARCHAR(16) NOT NULL CONSTRAINT DF_Sessions_InputMode DEFAULT 'Text';
-            IF COL_LENGTH('dbo.Sessions', 'RequiresValidation') IS NULL
-                ALTER TABLE dbo.Sessions ADD RequiresValidation BIT NOT NULL CONSTRAINT DF_Sessions_RequiresValidation DEFAULT 0;
-            IF COL_LENGTH('dbo.Sessions', 'SourceFileName') IS NULL
-                ALTER TABLE dbo.Sessions ADD SourceFileName NVARCHAR(260) NULL;
-            IF COL_LENGTH('dbo.Sessions', 'SourceFileReference') IS NULL
-                ALTER TABLE dbo.Sessions ADD SourceFileReference NVARCHAR(1024) NULL;
+            IF OBJECT_ID('dbo.Drafts', 'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.Drafts (
+                    DraftId NVARCHAR(64) NOT NULL PRIMARY KEY,
+                    UserId NVARCHAR(128) NOT NULL,
+                    SessionId NVARCHAR(64) NOT NULL,
+                    SourceType NVARCHAR(16) NOT NULL,
+                    Status NVARCHAR(32) NOT NULL,
+                    DraftJson NVARCHAR(MAX) NOT NULL,
+                    SkippedFieldsJson NVARCHAR(MAX) NOT NULL,
+                    CompletionState NVARCHAR(32) NOT NULL,
+                    CurrentStep NVARCHAR(32) NOT NULL,
+                    PendingField NVARCHAR(64) NULL,
+                    RequiresValidation BIT NOT NULL,
+                    SourceFileName NVARCHAR(260) NULL,
+                    SourceFileReference NVARCHAR(1024) NULL,
+                    CreatedAtUtc DATETIMEOFFSET NOT NULL,
+                    UpdatedAtUtc DATETIMEOFFSET NOT NULL,
+                    ConfirmedAtUtc DATETIMEOFFSET NULL,
+                    CONSTRAINT FK_Drafts_Sessions FOREIGN KEY (SessionId) REFERENCES dbo.Sessions(SessionId)
+                );
+
+                CREATE INDEX IX_Drafts_SessionId ON dbo.Drafts (SessionId);
+            END;
+
+            IF OBJECT_ID('dbo.DraftFieldState', 'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.DraftFieldState (
+                    Id INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                    DraftId NVARCHAR(64) NOT NULL,
+                    FieldName NVARCHAR(100) NOT NULL,
+                    Status NVARCHAR(32) NOT NULL,
+                    LastUpdated DATETIMEOFFSET NOT NULL,
+                    CONSTRAINT FK_DraftFieldState_Drafts FOREIGN KEY (DraftId) REFERENCES dbo.Drafts(DraftId)
+                );
+
+                CREATE INDEX IX_DraftFieldState_DraftId ON dbo.DraftFieldState (DraftId);
+            END;
+
+            IF OBJECT_ID('dbo.DraftVersions', 'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.DraftVersions (
+                    VersionId INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                    DraftId NVARCHAR(64) NOT NULL,
+                    VersionNumber INT NOT NULL,
+                    DraftJson NVARCHAR(MAX) NOT NULL,
+                    CreatedAtUtc DATETIMEOFFSET NOT NULL,
+                    CONSTRAINT FK_DraftVersions_Drafts FOREIGN KEY (DraftId) REFERENCES dbo.Drafts(DraftId)
+                );
+
+                CREATE UNIQUE INDEX UX_DraftVersions_Draft_Version ON dbo.DraftVersions (DraftId, VersionNumber);
+            END;
 
             IF OBJECT_ID('dbo.Messages', 'U') IS NULL
             BEGIN
                 CREATE TABLE dbo.Messages (
                     MessageId BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
                     SessionId NVARCHAR(64) NOT NULL,
-                    Role NVARCHAR(32) NOT NULL,
-                    Content NVARCHAR(MAX) NOT NULL,
+                    Sender NVARCHAR(20) NOT NULL,
+                    MessageText NVARCHAR(MAX) NOT NULL,
                     CreatedAtUtc DATETIMEOFFSET NOT NULL,
                     INDEX IX_Messages_SessionId (SessionId)
                 );
+            END;
+
+            IF COL_LENGTH('dbo.Messages', 'Sender') IS NULL
+                ALTER TABLE dbo.Messages ADD Sender NVARCHAR(20) NULL;
+            IF COL_LENGTH('dbo.Messages', 'MessageText') IS NULL
+                ALTER TABLE dbo.Messages ADD MessageText NVARCHAR(MAX) NULL;
+
+            IF OBJECT_ID('dbo.DraftAuditLog', 'U') IS NULL
+            BEGIN
+                CREATE TABLE dbo.DraftAuditLog (
+                    Id INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                    DraftId NVARCHAR(64) NOT NULL,
+                    Action NVARCHAR(100) NOT NULL,
+                    Details NVARCHAR(MAX) NULL,
+                    CreatedAtUtc DATETIMEOFFSET NOT NULL,
+                    CONSTRAINT FK_DraftAuditLog_Drafts FOREIGN KEY (DraftId) REFERENCES dbo.Drafts(DraftId)
+                );
+
+                CREATE INDEX IX_DraftAuditLog_DraftId ON dbo.DraftAuditLog (DraftId);
             END;
             """;
 
@@ -951,11 +1029,24 @@ public sealed class SqlSessionStore : ISessionStore
     public async Task<DraftSession?> GetSessionAsync(string sessionId, CancellationToken cancellationToken)
     {
         const string sql = """
-             SELECT SessionId, UserId, Status, CompletionState, CurrentStep,
-                 InputMode, RequiresValidation, SourceFileName, SourceFileReference,
-                 PendingField, DraftJson, SkippedFieldsJson, CreatedAtUtc, UpdatedAtUtc
-            FROM dbo.Sessions
-            WHERE SessionId = @SessionId;
+            SELECT
+                d.DraftId,
+                d.SessionId,
+                d.UserId,
+                d.Status,
+                d.CompletionState,
+                d.CurrentStep,
+                d.SourceType,
+                d.RequiresValidation,
+                d.SourceFileName,
+                d.SourceFileReference,
+                d.PendingField,
+                d.DraftJson,
+                d.SkippedFieldsJson,
+                d.CreatedAtUtc,
+                d.UpdatedAtUtc
+            FROM dbo.Drafts d
+            WHERE d.SessionId = @SessionId;
             """;
 
         await using var conn = new SqlConnection(_connectionString);
@@ -970,29 +1061,97 @@ public sealed class SqlSessionStore : ISessionStore
             return null;
         }
 
-        var draftJson = reader.GetString(10);
-        var skippedJson = reader.GetString(11);
+        var draftJson = reader.GetString(11);
+        var skippedJson = reader.GetString(12);
 
         return new DraftSession
         {
-            SessionId = reader.GetString(0),
-            UserId = reader.GetString(1),
-            Status = Enum.Parse<DraftStatus>(reader.GetString(2), ignoreCase: true),
-            CompletionState = reader.GetString(3),
-            CurrentStep = reader.GetString(4),
-            InputMode = Enum.Parse<InputMode>(reader.GetString(5), ignoreCase: true),
-            RequiresValidation = reader.GetBoolean(6),
-            SourceFileName = reader.IsDBNull(7) ? null : reader.GetString(7),
-            SourceFileReference = reader.IsDBNull(8) ? null : reader.GetString(8),
-            PendingField = reader.IsDBNull(9) ? null : reader.GetString(9),
+            SessionId = reader.GetString(1),
+            UserId = reader.GetString(2),
+            Status = Enum.Parse<DraftStatus>(reader.GetString(3), ignoreCase: true),
+            CompletionState = reader.GetString(4),
+            CurrentStep = reader.GetString(5),
+            InputMode = Enum.Parse<InputMode>(reader.GetString(6), ignoreCase: true),
+            RequiresValidation = reader.GetBoolean(7),
+            SourceFileName = reader.IsDBNull(8) ? null : reader.GetString(8),
+            SourceFileReference = reader.IsDBNull(9) ? null : reader.GetString(9),
+            PendingField = reader.IsDBNull(10) ? null : reader.GetString(10),
             Draft = JsonSerializer.Deserialize<MdrDraft>(draftJson, JsonOptions) ?? new MdrDraft(),
             SkippedFields = JsonSerializer.Deserialize<HashSet<string>>(skippedJson, JsonOptions) ?? [],
-            CreatedAtUtc = reader.GetFieldValue<DateTimeOffset>(12),
-            UpdatedAtUtc = reader.GetFieldValue<DateTimeOffset>(13)
+            CreatedAtUtc = reader.GetFieldValue<DateTimeOffset>(13),
+            UpdatedAtUtc = reader.GetFieldValue<DateTimeOffset>(14)
         };
     }
 
     public async Task UpsertSessionAsync(DraftSession session, CancellationToken cancellationToken)
+    {
+        await using var conn = new SqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        using var tx = (SqlTransaction)await conn.BeginTransactionAsync(cancellationToken);
+
+        var draftId = session.SessionId;
+        var now = session.UpdatedAtUtc;
+        var draftExists = await DraftExistsAsync(conn, tx, draftId, cancellationToken);
+
+        await UpsertSessionRowAsync(conn, tx, session, cancellationToken);
+        await UpsertDraftRowAsync(conn, tx, draftId, session, cancellationToken);
+        await ReplaceFieldStateAsync(conn, tx, draftId, session, now, cancellationToken);
+        await InsertDraftVersionAsync(conn, tx, draftId, session.Draft, now, cancellationToken);
+
+        var action = draftExists
+            ? session.Status switch
+            {
+                DraftStatus.Completed => "confirmed",
+                DraftStatus.Hold => "hold",
+                _ => "updated"
+            }
+            : "created";
+
+        var details = JsonSerializer.Serialize(new
+        {
+            session.SessionId,
+            session.UserId,
+            session.Status,
+            session.CompletionState,
+            session.CurrentStep,
+            session.InputMode
+        }, JsonOptions);
+
+        await InsertAuditLogAsync(conn, tx, draftId, action, details, now, cancellationToken);
+
+        await tx.CommitAsync(cancellationToken);
+    }
+
+    public async Task SaveMessageAsync(string sessionId, string role, string content, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            INSERT INTO dbo.Messages (SessionId, Sender, MessageText, CreatedAtUtc)
+            VALUES (@SessionId, @Sender, @MessageText, @CreatedAtUtc);
+            """;
+
+        await using var conn = new SqlConnection(_connectionString);
+        await conn.OpenAsync(cancellationToken);
+
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@SessionId", sessionId);
+        cmd.Parameters.AddWithValue("@Sender", role);
+        cmd.Parameters.AddWithValue("@MessageText", content);
+        cmd.Parameters.AddWithValue("@CreatedAtUtc", DateTimeOffset.UtcNow);
+
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task<bool> DraftExistsAsync(SqlConnection conn, SqlTransaction tx, string draftId, CancellationToken cancellationToken)
+    {
+        const string sql = "SELECT COUNT(1) FROM dbo.Drafts WHERE DraftId = @DraftId;";
+        await using var cmd = new SqlCommand(sql, conn, tx);
+        cmd.Parameters.AddWithValue("@DraftId", draftId);
+        var count = (int)await cmd.ExecuteScalarAsync(cancellationToken);
+        return count > 0;
+    }
+
+    private static async Task UpsertSessionRowAsync(SqlConnection conn, SqlTransaction tx, DraftSession session, CancellationToken cancellationToken)
     {
         const string sql = """
             MERGE dbo.Sessions AS target
@@ -1002,61 +1161,170 @@ public sealed class SqlSessionStore : ISessionStore
                 UPDATE SET
                     UserId = @UserId,
                     Status = @Status,
+                    UpdatedAtUtc = @UpdatedAtUtc
+            WHEN NOT MATCHED THEN
+                INSERT (SessionId, UserId, Status, CreatedAtUtc, UpdatedAtUtc)
+                VALUES (@SessionId, @UserId, @Status, @CreatedAtUtc, @UpdatedAtUtc);
+            """;
+
+        await using var cmd = new SqlCommand(sql, conn, tx);
+        cmd.Parameters.AddWithValue("@SessionId", session.SessionId);
+        cmd.Parameters.AddWithValue("@UserId", session.UserId);
+        cmd.Parameters.AddWithValue("@Status", session.Status == DraftStatus.Completed ? "closed" : "active");
+        cmd.Parameters.AddWithValue("@CreatedAtUtc", session.CreatedAtUtc);
+        cmd.Parameters.AddWithValue("@UpdatedAtUtc", session.UpdatedAtUtc);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private static async Task UpsertDraftRowAsync(SqlConnection conn, SqlTransaction tx, string draftId, DraftSession session, CancellationToken cancellationToken)
+    {
+        const string sql = """
+            MERGE dbo.Drafts AS target
+            USING (SELECT @DraftId AS DraftId) AS source
+            ON (target.DraftId = source.DraftId)
+            WHEN MATCHED THEN
+                UPDATE SET
+                    UserId = @UserId,
+                    SessionId = @SessionId,
+                    SourceType = @SourceType,
+                    Status = @Status,
+                    DraftJson = @DraftJson,
+                    SkippedFieldsJson = @SkippedFieldsJson,
                     CompletionState = @CompletionState,
                     CurrentStep = @CurrentStep,
-                    InputMode = @InputMode,
+                    PendingField = @PendingField,
                     RequiresValidation = @RequiresValidation,
                     SourceFileName = @SourceFileName,
                     SourceFileReference = @SourceFileReference,
-                    PendingField = @PendingField,
-                    DraftJson = @DraftJson,
-                    SkippedFieldsJson = @SkippedFieldsJson,
-                    UpdatedAtUtc = @UpdatedAtUtc
+                    UpdatedAtUtc = @UpdatedAtUtc,
+                    ConfirmedAtUtc = CASE WHEN @Status = 'Completed' THEN @UpdatedAtUtc ELSE ConfirmedAtUtc END
             WHEN NOT MATCHED THEN
-                INSERT (SessionId, UserId, Status, CompletionState, CurrentStep, InputMode, RequiresValidation, SourceFileName, SourceFileReference, PendingField, DraftJson, SkippedFieldsJson, CreatedAtUtc, UpdatedAtUtc)
-                VALUES (@SessionId, @UserId, @Status, @CompletionState, @CurrentStep, @InputMode, @RequiresValidation, @SourceFileName, @SourceFileReference, @PendingField, @DraftJson, @SkippedFieldsJson, @CreatedAtUtc, @UpdatedAtUtc);
+                INSERT (DraftId, UserId, SessionId, SourceType, Status, DraftJson, SkippedFieldsJson, CompletionState, CurrentStep, PendingField, RequiresValidation, SourceFileName, SourceFileReference, CreatedAtUtc, UpdatedAtUtc, ConfirmedAtUtc)
+                VALUES (@DraftId, @UserId, @SessionId, @SourceType, @Status, @DraftJson, @SkippedFieldsJson, @CompletionState, @CurrentStep, @PendingField, @RequiresValidation, @SourceFileName, @SourceFileReference, @CreatedAtUtc, @UpdatedAtUtc, CASE WHEN @Status = 'Completed' THEN @UpdatedAtUtc ELSE NULL END);
             """;
 
-        await using var conn = new SqlConnection(_connectionString);
-        await conn.OpenAsync(cancellationToken);
-
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@SessionId", session.SessionId);
+        await using var cmd = new SqlCommand(sql, conn, tx);
+        cmd.Parameters.AddWithValue("@DraftId", draftId);
         cmd.Parameters.AddWithValue("@UserId", session.UserId);
+        cmd.Parameters.AddWithValue("@SessionId", session.SessionId);
+        cmd.Parameters.AddWithValue("@SourceType", session.InputMode.ToString());
         cmd.Parameters.AddWithValue("@Status", session.Status.ToString());
+        cmd.Parameters.AddWithValue("@DraftJson", JsonSerializer.Serialize(session.Draft, JsonOptions));
+        cmd.Parameters.AddWithValue("@SkippedFieldsJson", JsonSerializer.Serialize(session.SkippedFields, JsonOptions));
         cmd.Parameters.AddWithValue("@CompletionState", session.CompletionState);
         cmd.Parameters.AddWithValue("@CurrentStep", session.CurrentStep);
-        cmd.Parameters.AddWithValue("@InputMode", session.InputMode.ToString());
+        cmd.Parameters.AddWithValue("@PendingField", (object?)session.PendingField ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@RequiresValidation", session.RequiresValidation);
         cmd.Parameters.AddWithValue("@SourceFileName", (object?)session.SourceFileName ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@SourceFileReference", (object?)session.SourceFileReference ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@PendingField", (object?)session.PendingField ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("@DraftJson", JsonSerializer.Serialize(session.Draft, JsonOptions));
-        cmd.Parameters.AddWithValue("@SkippedFieldsJson", JsonSerializer.Serialize(session.SkippedFields, JsonOptions));
         cmd.Parameters.AddWithValue("@CreatedAtUtc", session.CreatedAtUtc);
         cmd.Parameters.AddWithValue("@UpdatedAtUtc", session.UpdatedAtUtc);
-
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public async Task SaveMessageAsync(string sessionId, string role, string content, CancellationToken cancellationToken)
+    private static async Task ReplaceFieldStateAsync(
+        SqlConnection conn,
+        SqlTransaction tx,
+        string draftId,
+        DraftSession session,
+        DateTimeOffset timestamp,
+        CancellationToken cancellationToken)
     {
-        const string sql = """
-            INSERT INTO dbo.Messages (SessionId, Role, Content, CreatedAtUtc)
-            VALUES (@SessionId, @Role, @Content, @CreatedAtUtc);
+        const string deleteSql = "DELETE FROM dbo.DraftFieldState WHERE DraftId = @DraftId;";
+        await using (var deleteCmd = new SqlCommand(deleteSql, conn, tx))
+        {
+            deleteCmd.Parameters.AddWithValue("@DraftId", draftId);
+            await deleteCmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        var fieldStates = BuildFieldStates(session);
+        const string insertSql = """
+            INSERT INTO dbo.DraftFieldState (DraftId, FieldName, Status, LastUpdated)
+            VALUES (@DraftId, @FieldName, @Status, @LastUpdated);
             """;
 
-        await using var conn = new SqlConnection(_connectionString);
-        await conn.OpenAsync(cancellationToken);
+        foreach (var fieldState in fieldStates)
+        {
+            await using var insertCmd = new SqlCommand(insertSql, conn, tx);
+            insertCmd.Parameters.AddWithValue("@DraftId", draftId);
+            insertCmd.Parameters.AddWithValue("@FieldName", fieldState.FieldName);
+            insertCmd.Parameters.AddWithValue("@Status", fieldState.Status);
+            insertCmd.Parameters.AddWithValue("@LastUpdated", timestamp);
+            await insertCmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+    }
 
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@SessionId", sessionId);
-        cmd.Parameters.AddWithValue("@Role", role);
-        cmd.Parameters.AddWithValue("@Content", content);
-        cmd.Parameters.AddWithValue("@CreatedAtUtc", DateTimeOffset.UtcNow);
+    private static List<DraftFieldStateRow> BuildFieldStates(DraftSession session)
+    {
+        var draft = session.Draft;
+        var skipped = session.SkippedFields;
+        return new List<DraftFieldStateRow>
+        {
+            new(nameof(MdrDraft.ArrangementId), ResolveFieldStatus(nameof(MdrDraft.ArrangementId), !string.IsNullOrWhiteSpace(draft.ArrangementId), skipped)),
+            new(nameof(MdrDraft.Country), ResolveFieldStatus(nameof(MdrDraft.Country), !string.IsNullOrWhiteSpace(draft.Country), skipped)),
+            new(nameof(MdrDraft.Description), ResolveFieldStatus(nameof(MdrDraft.Description), !string.IsNullOrWhiteSpace(draft.Description), skipped)),
+            new(nameof(MdrDraft.Entities), ResolveFieldStatus(nameof(MdrDraft.Entities), draft.Entities.Count > 0, skipped))
+        };
+    }
 
+    private static string ResolveFieldStatus(string fieldName, bool hasValue, HashSet<string> skipped)
+    {
+        if (skipped.Contains(fieldName))
+        {
+            return "skipped";
+        }
+
+        return hasValue ? "provided" : "missing";
+    }
+
+    private static async Task InsertDraftVersionAsync(
+        SqlConnection conn,
+        SqlTransaction tx,
+        string draftId,
+        MdrDraft draft,
+        DateTimeOffset timestamp,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            DECLARE @NextVersion INT;
+            SELECT @NextVersion = ISNULL(MAX(VersionNumber), 0) + 1
+            FROM dbo.DraftVersions
+            WHERE DraftId = @DraftId;
+
+            INSERT INTO dbo.DraftVersions (DraftId, VersionNumber, DraftJson, CreatedAtUtc)
+            VALUES (@DraftId, @NextVersion, @DraftJson, @CreatedAtUtc);
+            """;
+
+        await using var cmd = new SqlCommand(sql, conn, tx);
+        cmd.Parameters.AddWithValue("@DraftId", draftId);
+        cmd.Parameters.AddWithValue("@DraftJson", JsonSerializer.Serialize(draft, JsonOptions));
+        cmd.Parameters.AddWithValue("@CreatedAtUtc", timestamp);
         await cmd.ExecuteNonQueryAsync(cancellationToken);
     }
+
+    private static async Task InsertAuditLogAsync(
+        SqlConnection conn,
+        SqlTransaction tx,
+        string draftId,
+        string action,
+        string details,
+        DateTimeOffset timestamp,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            INSERT INTO dbo.DraftAuditLog (DraftId, Action, Details, CreatedAtUtc)
+            VALUES (@DraftId, @Action, @Details, @CreatedAtUtc);
+            """;
+
+        await using var cmd = new SqlCommand(sql, conn, tx);
+        cmd.Parameters.AddWithValue("@DraftId", draftId);
+        cmd.Parameters.AddWithValue("@Action", action);
+        cmd.Parameters.AddWithValue("@Details", details);
+        cmd.Parameters.AddWithValue("@CreatedAtUtc", timestamp);
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private readonly record struct DraftFieldStateRow(string FieldName, string Status);
 }
 
 public sealed class FoundrySettings
