@@ -23,6 +23,65 @@ dotnet run --project .\src\ComplianceAgent.Backend\ComplianceAgent.Backend.cspro
 
 The API exposes:
 
+1. `POST /draft/create` (unified text ingestion contract)
+2. `POST /draft/from-file` (multipart upload)
+3. `POST /draft/validate` (file-flow validation gate)
+4. `POST /draft/from-text` (text ingestion, backward-compatible)
+5. `POST /draft/respond` (clarification answer/skip)
+6. `POST /draft/hold` (explicit hold state)
+7. `POST /draft/confirm` (final confirmation)
+8. `GET /draft/session/{sessionId}` (session state)
+
+## Unified Input Contract
+
+Use `POST /draft/create` for text ingestion with a common request shape:
+
+```json
+{
+	"userId": "user-123",
+	"sessionId": "optional",
+	"inputMode": "Text",
+	"inputText": "Arrangement in Germany between Alpha GmbH and Beta SARL requiring disclosure."
+}
+```
+
+For file ingestion use `POST /draft/from-file` (multipart form data) with `userId`, optional `sessionId`, and `file`.
+
+## File Validation Loop
+
+File ingestion now returns `currentStep: "validation"` and `requiresValidation: true`.
+Before clarification can continue, call `POST /draft/validate`:
+
+```json
+{
+	"sessionId": "<session-id>",
+	"accepted": true,
+	"corrections": {
+		"arrangementId": null,
+		"country": "Germany",
+		"description": "Optional correction",
+		"entities": ["Alpha GmbH", "Beta SARL"],
+		"status": "draft"
+	}
+}
+```
+
+If `accepted` is `false`, the draft moves to hold (`status: "Hold"`, `completionState: "hold"`).
+
+## Lifecycle States
+
+`status` is serialized as string values:
+
+1. `Started`
+2. `InProgress`
+3. `Hold`
+4. `Review`
+5. `Completed`
+
+`completionState` values used in responses include `partial`, `ready_for_review`, `hold`, and `completed`.
+
+## Original Endpoints
+
 1. `POST /draft/from-text`
 2. `POST /draft/respond`
 3. `POST /draft/confirm`
