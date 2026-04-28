@@ -613,6 +613,7 @@ public sealed class MdrDraft
     public string? Country { get; set; }
     public string? Description { get; set; }
     public List<string> Entities { get; set; } = [];
+    public string? TransactionType { get; set; }
     public string Status { get; set; } = "draft";
 }
 
@@ -656,6 +657,32 @@ public interface IAiExtractionService
 
 public sealed class FoundryExtractionService : IAiExtractionService
 {
+        private const string DraftSchemaJson = """
+                {
+                    "arrangementId": null,
+                    "country": null,
+                    "entities": [],
+                    "description": null,
+                    "transactionType": null,
+                    "status": "draft"
+                }
+                """;
+
+        private const string ExtractionFewShot = """
+                Example Input:
+                "The company ABC GmbH entered a financing agreement in Germany."
+
+                Example Output:
+                {
+                    "arrangementId": null,
+                    "country": "Germany",
+                    "entities": ["ABC GmbH"],
+                    "description": "Financing agreement",
+                    "transactionType": null,
+                    "status": "draft"
+                }
+                """;
+
     private readonly FoundrySettings _settings;
     private readonly ILogger<FoundryExtractionService> _logger;
 
@@ -681,27 +708,13 @@ public sealed class FoundryExtractionService : IAiExtractionService
             var agent = projectClient.AsAIAgent(
                 model: _settings.Model,
                 name: _settings.AgentName,
-                instructions: "You extract MDR draft fields from user text. Never guess. Unknown fields must be null or empty arrays.");
+                instructions: """
+                    You extract structured MDR arrangement draft data from unstructured input.
+                    Accuracy is mandatory: never guess, infer, or invent missing values.
+                    Always return JSON only and match the requested schema exactly.
+                    """);
 
-            var prompt = $$"""
-                Extract MDR draft fields from this text and return JSON only.
-
-                Rules:
-                - Extract only explicitly stated values.
-                - If a value is missing, set it to null (or [] for entities).
-                - Do not infer or invent values.
-                - Return ONLY valid JSON with this exact shape:
-                {
-                  "arrangementId": string|null,
-                  "country": string|null,
-                  "description": string|null,
-                  "entities": string[],
-                  "status": "draft"
-                }
-
-                Input:
-                {{inputText}}
-                """;
+            var prompt = BuildExtractionPrompt(inputText);
 
             var response = await agent.RunAsync(prompt, cancellationToken: cancellationToken);
             if (TryParseDraftFromResponse(response.Text, out var parsed) && parsed is not null)
@@ -717,6 +730,42 @@ public sealed class FoundryExtractionService : IAiExtractionService
             _logger.LogError(ex, "Extraction call failed; returning fallback draft.");
             return fallback;
         }
+    }
+
+    private static string BuildExtractionPrompt(string inputText)
+    {
+        return $$"""
+            You are an AI system that extracts structured MDR arrangement data from input text.
+
+            Rules:
+            - Extract only information explicitly present in the input.
+            - Do NOT infer, assume, enrich, normalize, or guess missing values.
+            - If a field is not present, return null (or [] for entities).
+            - Keep output partial when data is incomplete.
+            - Return only valid JSON.
+            - Do not add extra fields.
+            - Always set "status" to "draft".
+
+            Field definitions:
+            - arrangementId: Identifier of the arrangement when explicitly provided.
+            - country: Country associated with the arrangement.
+            - entities: List of explicitly mentioned involved entities.
+            - description: Short arrangement summary based only on explicit input text.
+            - transactionType: Explicitly stated transaction type if present.
+
+            Output JSON schema:
+            {{DraftSchemaJson}}
+
+            {{ExtractionFewShot}}
+
+            Input:
+            <input>
+            {{inputText}}
+            </input>
+
+            Return:
+            Only valid JSON.
+            """;
     }
 
     private static bool TryParseDraftFromResponse(string responseText, out MdrDraft? draft)
@@ -822,6 +871,7 @@ public static class DraftMerger
                 Country = current.Country,
                 Description = current.Description,
                 Entities = [.. current.Entities],
+                TransactionType = current.TransactionType,
                 Status = current.Status
             };
 
@@ -834,6 +884,7 @@ public static class DraftMerger
         if (!string.IsNullOrWhiteSpace(incoming.Country)) result.Country = incoming.Country.Trim();
         if (!string.IsNullOrWhiteSpace(incoming.Description)) result.Description = incoming.Description.Trim();
         if (incoming.Entities.Count > 0) result.Entities = incoming.Entities.Where(e => !string.IsNullOrWhiteSpace(e)).Select(e => e.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        if (!string.IsNullOrWhiteSpace(incoming.TransactionType)) result.TransactionType = incoming.TransactionType.Trim();
         result.Status = "draft";
 
         return result;
