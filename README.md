@@ -1,83 +1,142 @@
-# Compliance Agent Backend
+# Compliance Agent
 
-Minimal backend service under `src\ComplianceAgent.Backend` that builds MDR drafts from free-form text with a clarification loop before final confirmation.
+An automated compliance extraction tool built on [Azure AI Foundry](https://learn.microsoft.com/en-us/azure/ai-studio/). It leverages a declarative agent with the **Code Interpreter** tool to read PDF documents describing arrangements and produce structured JSON output aligned to the reporting schema.
+
+---
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [Project Structure](#project-structure)
+- [Prerequisites](#prerequisites)
+- [Getting Started](#getting-started)
+- [Usage](#usage)
+- [Configuration](#configuration)
+- [Key Dependencies](#key-dependencies)
+
+
+**Flow:**
+1. The CLI uploads the input PDF to Foundry via the Files API.
+2. A declarative agent is created with Code Interpreter access to the uploaded file.
+3. Extraction prompts are sent to the agent, which reads the PDF in a sandboxed environment.
+4. The agent returns structured JSON, which is validated and saved locally.
+5. The agent version is cleaned up automatically.
+
+---
+
+## Project Structure
+
+```
+compliance-agent/
+├── src/
+│   ├── ComplianceAgent.Backend/     # CLI entry point & configuration
+│   │   ├── Program.cs               # Argument parsing, prompt loading, orchestration
+│   │   ├── appsettings.json         # Runtime configuration (gitignored)
+│   │   └── appsettings.template.json# Configuration template
+│   ├── ComplianceAgent.Services/    # Service layer (Azure AI Foundry integration)
+│   │   ├── ExtractionService.cs     # Agent creation, file upload, prompt execution
+│   │   ├── ExtractionResult.cs      # Extraction result model
+│   │   └── FoundrySettings.cs       # Foundry configuration model
+│   └── prompts/                     # Externalised agent prompts
+│       ├── ExtractionAgentInstructions.txt  # System instructions with JSON schema
+│       └── ExtractionPrompt.txt             # User-facing extraction prompt
+├── data/                            # Sample input files & reference schema
+├── extractedjson/                   # Timestamped extraction output
+├── docs/                            # Architecture & design documentation
+├── compliance-agent.sln
+└── README.md
+```
+
+---
 
 ## Prerequisites
 
-- .NET 10 SDK
-- Azure AI Foundry project + model deployment
-- Microsoft Entra access (run `az login`)
-- Optional: Azure SQL connection string for persistent sessions
+| Requirement | Details |
+|---|---|
+| **.NET 8 SDK** | [Download](https://dotnet.microsoft.com/download/dotnet/8.0) |
+| **Azure Subscription** | With access to Azure AI Foundry |
+| **Azure AI Foundry Project** | A project with a deployed model (e.g. `gpt-5.2`) |
+| **Microsoft Entra ID** | Authenticated via `az login` or managed identity |
+| **Storage Account Access** | The Foundry-linked storage account must allow file uploads |
 
-## Setup
+---
 
-1. Copy `src\ComplianceAgent.Backend\appsettings.template.json` to `src\ComplianceAgent.Backend\appsettings.json`.
-2. Set `Foundry.Endpoint` and `Foundry.Model`.
-3. Optional: set `ConnectionStrings:Drafts` (or `Storage:ConnectionString`) to persist sessions/messages in Azure SQL.
+## Getting Started
 
-## Run
+### 1. Clone the repository
 
-```powershell
-dotnet run --project .\src\ComplianceAgent.Backend\ComplianceAgent.Backend.csproj
+```bash
+git clone <repository-url>
+cd compliance-agent
 ```
 
-The API exposes:
+### 2. Configure settings
 
-1. `POST /draft/from-text`
-2. `POST /draft/respond`
-3. `POST /draft/confirm`
-
-## Flow Overview
-
-1. Submit free text to `/draft/from-text`.
-2. The service extracts known fields only and leaves unknown fields null/empty.
-3. If required fields are missing, it returns a follow-up question (`pendingField`, `nextQuestion`).
-4. Reply via `/draft/respond` with either `answer` or `skip=true`.
-5. Confirm the review-ready draft using `/draft/confirm`.
-
-## Example Calls
-
-```powershell
-$fromText = @{
-	userId = "user-123"
-	inputText = "Arrangement in Germany between Alpha GmbH and Beta SARL requiring disclosure."
-} | ConvertTo-Json
-
-Invoke-RestMethod -Uri "http://127.0.0.1:5187/draft/from-text" -Method Post -ContentType "application/json" -Body $fromText
+```bash
+cp src/ComplianceAgent.Backend/appsettings.template.json src/ComplianceAgent.Backend/appsettings.json
 ```
 
-```powershell
-$respond = @{
-	sessionId = "<session-id-from-previous-response>"
-	answer = "MDR-2026-0007"
-	skip = $false
-} | ConvertTo-Json
+Edit `appsettings.json` with your Foundry project details:
 
-Invoke-RestMethod -Uri "http://127.0.0.1:5187/draft/respond" -Method Post -ContentType "application/json" -Body $respond
+```json
+{
+  "Foundry": {
+    "Endpoint": "https://<your-foundry>.services.ai.azure.com/api/projects/<your-project>",
+    "Model": "gpt-5.2",
+    "AgentName": "compliance-agent-backend"
+  },
+  "InputFile": "data\\input1.pdf"
+}
 ```
 
-```powershell
-$confirm = @{ sessionId = "<session-id-from-previous-response>" } | ConvertTo-Json
+### 3. Authenticate
 
-Invoke-RestMethod -Uri "http://127.0.0.1:5187/draft/confirm" -Method Post -ContentType "application/json" -Body $confirm
+```bash
+az login
 ```
 
-## Smoke Test
+### 4. Build
 
-Run a one-command verification that covers:
-
-1. Health endpoint check
-2. Answer-path flow (`/draft/from-text` -> `/draft/respond` -> `/draft/confirm`)
-3. Skip-path flow (`/draft/from-text` -> repeated `/draft/respond` with `skip=true` -> `/draft/confirm`)
-
-From repo root:
-
-```powershell
-.\scripts\manual_smoke.ps1
+```bash
+dotnet build compliance-agent.sln
 ```
 
-Use a custom API base URL:
+---
+
+## Usage
+
+### Extract from a specific PDF
 
 ```powershell
-.\scripts\manual_smoke.ps1 -BaseUrl "http://127.0.0.1:5190"
+dotnet run --project src/ComplianceAgent.Backend -- --file-input data/input1.pdf
 ```
+
+### Use the default input file from configuration
+
+```powershell
+dotnet run --project src/ComplianceAgent.Backend
+```
+
+> The `--file-input` CLI argument takes precedence over the `InputFile` value in `appsettings.json`.
+
+---
+
+## Configuration
+
+| Setting | Description | Default |
+|---|---|---|
+| `Foundry.Endpoint` | Azure AI Foundry project endpoint URL | *(required)* |
+| `Foundry.Model` | Deployed model name | `gpt-4o-mini` |
+| `Foundry.AgentName` | Agent name used for version management | `compliance-agent-backend` |
+| `InputFile` | Default input file path (relative to repo root) | `data\input1.pdf` |
+
+---
+
+## Key Dependencies
+
+| Package | Version | Purpose |
+|---|---|---|
+| `Azure.AI.Projects` | 2.0.0 | Foundry project client |
+| `Azure.AI.Projects.Agents` | 2.0.0 | Declarative agent definitions & versioning |
+| `Azure.AI.Extensions.OpenAI` | 2.0.0 | ProjectResponsesClient & agent references |
+| `Azure.Identity` | 1.21.0 | Microsoft Entra ID authentication |

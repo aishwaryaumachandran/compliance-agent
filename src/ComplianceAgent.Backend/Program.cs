@@ -1,284 +1,113 @@
-using System.Data;
 using System.Text.Json;
-using System.Text.RegularExpressions;
-using Azure.AI.Projects;
-using Azure.Identity;
-using Microsoft.Agents.AI;
-using Microsoft.Data.SqlClient;
+using ComplianceAgent.Services;
 
-var builder = WebApplication.CreateBuilder(args);
+const string DefaultAgentInstructions = """
+You are a regulatory compliance extraction agent.
 
-builder.Services.Configure<FoundrySettings>(builder.Configuration.GetSection("Foundry"));
-builder.Services.AddSingleton<IMissingFieldService, MissingFieldService>();
-builder.Services.AddSingleton<IAiExtractionService, FoundryExtractionService>();
+Rules:
+- Read the uploaded document using Code Interpreter.
+- Return ONLY valid JSON.
+- Do not include markdown fences.
+- If a value is missing, set it to null (or [] for arrays).
+- Do not infer or invent values.
+""";
 
-var sqlConnectionString =
-    builder.Configuration.GetConnectionString("Drafts")
-    ?? builder.Configuration["Storage:ConnectionString"];
+const string DefaultExtractionPrompt = """
+Extract structured arrangement data from the uploaded file '{{input_file}}'.
+
+Return ONLY JSON using this exact shape:
+{
+    "arrangementId": null,
+    "country": null,
+    "entities": [],
+    "description": null,
+    "transactionType": null,
+    "status": "draft"
+}
+
+Do not add extra fields.
+""";
+
+// --- Parse CLI arguments ---
+string? fileInputArg = null;
+for (int i = 0; i < args.Length; i++)
+{
+    if (args[i] is "--file-input" && i + 1 < args.Length)
+    {
+        fileInputArg = args[++i];
+    }
+}
+
+// --- Load settings ---
+const string SettingsFileName = "appsettings.json";
+var settingsPath = ResolveSettingsPath(SettingsFileName)
+    ?? throw new FileNotFoundException(
+        $"Could not find '{SettingsFileName}'. Place it in repo root or in 'src\\ComplianceAgent.Backend'.");
 
 if (!string.IsNullOrWhiteSpace(sqlConnectionString))
 {
-    builder.Services.AddSingleton<ISessionStore>(_ => new SqlSessionStore(sqlConnectionString));
+    PropertyNameCaseInsensitive = true
+}) ?? throw new InvalidOperationException("Could not parse appsettings.json.");
+
+if (string.IsNullOrWhiteSpace(settings.Foundry.Endpoint))
+    throw new InvalidOperationException("Foundry:Endpoint is required in appsettings.json.");
+if (string.IsNullOrWhiteSpace(settings.Foundry.Model))
+    throw new InvalidOperationException("Foundry:Model is required in appsettings.json.");
+
+// CLI --file-input overrides appsettings.json InputFile
+var configuredInput = fileInputArg ?? settings.InputFile;
+if (string.IsNullOrWhiteSpace(configuredInput))
+    throw new InvalidOperationException("No input file specified. Use --file-input <path> or set InputFile in appsettings.json.");
+
+var inputFile = ResolveInputFilePath(configuredInput, Path.GetDirectoryName(settingsPath)!)
+    ?? throw new FileNotFoundException($"Input file not found: {configuredInput}");
+
+Console.WriteLine($"Processing: {Path.GetFileName(inputFile)}");
+
+// --- Load prompts ---
+var agentInstructions = await LoadPromptTextAsync(
+    "ExtractionAgentInstructions.txt",
+    DefaultAgentInstructions);
+
+var extractionPromptTemplate = await LoadPromptTextAsync(
+    "ExtractionPrompt.txt",
+    DefaultExtractionPrompt);
+
+var extractionPrompt = extractionPromptTemplate.Replace("{{input_file}}", Path.GetFileName(inputFile));
+extractionPrompt = extractionPrompt.Replace("{{file_name}}", Path.GetFileName(inputFile));
+
+// --- Run extraction ---
+var foundrySettings = new FoundrySettings
+{
+    Endpoint = settings.Foundry.Endpoint,
+    Model = settings.Foundry.Model,
+    AgentName = settings.Foundry.AgentName
+};
+
+var extractionService = new ExtractionService(foundrySettings);
+var result = await extractionService.ExtractAsync(inputFile, agentInstructions, extractionPrompt);
+
+if (result.Success)
+{
+    var outputDir = Path.Combine(Directory.GetCurrentDirectory(), "extractedjson");
+    Directory.CreateDirectory(outputDir);
+    var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+    var outputFileName = $"{Path.GetFileNameWithoutExtension(inputFile)}_extracted_{timestamp}.json";
+    var outputPath = Path.Combine(outputDir, outputFileName);
+    await File.WriteAllTextAsync(outputPath, result.Json);
+
+    Console.WriteLine($"Extraction complete. Output saved to: {outputPath}");
+    Console.WriteLine();
+    Console.WriteLine(result.Json);
 }
 else
 {
-    builder.Services.AddSingleton<ISessionStore, InMemorySessionStore>();
+    Console.WriteLine($"Warning: {result.Error}");
+    Console.WriteLine("Raw output:");
+    Console.WriteLine(result.Json);
 }
 
-var app = builder.Build();
-
-app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
-
-app.MapPost("/draft/from-text", async (
-    DraftFromTextRequest request,
-    ISessionStore store,
-    IAiExtractionService extractionService,
-    IMissingFieldService missingFieldService,
-    ILoggerFactory loggerFactory,
-    CancellationToken cancellationToken) =>
-{
-    if (string.IsNullOrWhiteSpace(request.UserId) || string.IsNullOrWhiteSpace(request.InputText))
-    {
-        return Results.BadRequest(new { error = "userId and inputText are required." });
-    }
-
-    var logger = loggerFactory.CreateLogger("DraftFromText");
-    var sessionId = string.IsNullOrWhiteSpace(request.SessionId)
-        ? Guid.NewGuid().ToString("N")
-        : request.SessionId;
-
-    var session = await store.GetSessionAsync(sessionId, cancellationToken)
-        ?? DraftSession.CreateNew(sessionId, request.UserId);
-
-    session.CurrentStep = "extraction";
-    await store.SaveMessageAsync(sessionId, "user", request.InputText, cancellationToken);
-
-    var extracted = await extractionService.ExtractAsync(request.InputText, session.Draft, cancellationToken);
-    session.Draft = DraftMerger.Merge(session.Draft, extracted);
-
-    var missingFields = missingFieldService.GetMissingFields(session.Draft)
-        .Where(field => !session.SkippedFields.Contains(field))
-        .ToList();
-
-    if (missingFields.Count > 0)
-    {
-        session.Status = DraftStatus.InProgress;
-        session.CompletionState = "partial";
-        session.CurrentStep = "clarification";
-        session.PendingField = missingFields[0];
-        session.UpdatedAtUtc = DateTimeOffset.UtcNow;
-
-        var question = missingFieldService.BuildQuestion(session.PendingField);
-        await store.SaveMessageAsync(sessionId, "assistant", question, cancellationToken);
-        await store.UpsertSessionAsync(session, cancellationToken);
-
-        logger.LogInformation("Draft session {SessionId} extracted with {MissingCount} missing fields", sessionId, missingFields.Count);
-
-        return Results.Ok(DraftResult.FromSession(session, missingFields, question));
-    }
-
-    session.Status = DraftStatus.Review;
-    session.CompletionState = "ready_for_review";
-    session.CurrentStep = "review";
-    session.PendingField = null;
-    session.UpdatedAtUtc = DateTimeOffset.UtcNow;
-
-    await store.UpsertSessionAsync(session, cancellationToken);
-
-    return Results.Ok(DraftResult.FromSession(session, [], null));
-});
-
-app.MapPost("/draft/respond", async (
-    DraftRespondRequest request,
-    ISessionStore store,
-    IMissingFieldService missingFieldService,
-    ILoggerFactory loggerFactory,
-    CancellationToken cancellationToken) =>
-{
-    if (string.IsNullOrWhiteSpace(request.SessionId))
-    {
-        return Results.BadRequest(new { error = "sessionId is required." });
-    }
-
-    var logger = loggerFactory.CreateLogger("DraftRespond");
-    var session = await store.GetSessionAsync(request.SessionId, cancellationToken);
-    if (session is null)
-    {
-        return Results.NotFound(new { error = "Session not found." });
-    }
-
-    if (string.IsNullOrWhiteSpace(session.PendingField))
-    {
-        return Results.BadRequest(new { error = "No pending clarification question for this session." });
-    }
-
-    if (!request.Skip && string.IsNullOrWhiteSpace(request.Answer))
-    {
-        return Results.BadRequest(new { error = "answer is required when skip is false." });
-    }
-
-    if (request.Skip)
-    {
-        session.SkippedFields.Add(session.PendingField);
-        await store.SaveMessageAsync(session.SessionId, "user", $"Skipped field: {session.PendingField}", cancellationToken);
-    }
-    else
-    {
-        DraftFieldUpdater.ApplyUserAnswer(session.Draft, session.PendingField, request.Answer!);
-        await store.SaveMessageAsync(session.SessionId, "user", request.Answer!, cancellationToken);
-    }
-
-    var remaining = missingFieldService.GetMissingFields(session.Draft)
-        .Where(field => !session.SkippedFields.Contains(field))
-        .ToList();
-
-    if (remaining.Count > 0)
-    {
-        session.Status = DraftStatus.InProgress;
-        session.CompletionState = "partial";
-        session.CurrentStep = "clarification";
-        session.PendingField = remaining[0];
-        session.UpdatedAtUtc = DateTimeOffset.UtcNow;
-
-        var question = missingFieldService.BuildQuestion(session.PendingField);
-        await store.SaveMessageAsync(session.SessionId, "assistant", question, cancellationToken);
-        await store.UpsertSessionAsync(session, cancellationToken);
-
-        logger.LogInformation("Draft session {SessionId} updated; still missing {MissingCount} fields", session.SessionId, remaining.Count);
-        return Results.Ok(DraftResult.FromSession(session, remaining, question));
-    }
-
-    session.Status = DraftStatus.Review;
-    session.CompletionState = "ready_for_review";
-    session.CurrentStep = "review";
-    session.PendingField = null;
-    session.UpdatedAtUtc = DateTimeOffset.UtcNow;
-
-    await store.UpsertSessionAsync(session, cancellationToken);
-    return Results.Ok(DraftResult.FromSession(session, [], null));
-});
-
-app.MapPost("/draft/confirm", async (
-    DraftConfirmRequest request,
-    ISessionStore store,
-    CancellationToken cancellationToken) =>
-{
-    if (string.IsNullOrWhiteSpace(request.SessionId))
-    {
-        return Results.BadRequest(new { error = "sessionId is required." });
-    }
-
-    var session = await store.GetSessionAsync(request.SessionId, cancellationToken);
-    if (session is null)
-    {
-        return Results.NotFound(new { error = "Session not found." });
-    }
-
-    if (request.Corrections is not null)
-    {
-        session.Draft = DraftMerger.Merge(session.Draft, request.Corrections);
-    }
-
-    session.Status = DraftStatus.Completed;
-    session.CompletionState = "completed";
-    session.CurrentStep = "completed";
-    session.PendingField = null;
-    session.UpdatedAtUtc = DateTimeOffset.UtcNow;
-
-    await store.UpsertSessionAsync(session, cancellationToken);
-    await store.SaveMessageAsync(session.SessionId, "system", "Draft confirmed by user.", cancellationToken);
-
-    return Results.Ok(DraftResult.FromSession(session, [], null));
-});
-
-if (app.Services.GetRequiredService<ISessionStore>() is SqlSessionStore sqlStore)
-{
-    await sqlStore.EnsureSchemaAsync(CancellationToken.None);
-}
-
-app.Run();
-
-public enum DraftStatus
-{
-    Started,
-    InProgress,
-    Review,
-    Completed
-}
-
-public sealed class DraftFromTextRequest
-{
-    public string UserId { get; set; } = string.Empty;
-    public string? SessionId { get; set; }
-    public string InputText { get; set; } = string.Empty;
-}
-
-public sealed class DraftRespondRequest
-{
-    public string SessionId { get; set; } = string.Empty;
-    public string? Answer { get; set; }
-    public bool Skip { get; set; }
-}
-
-public sealed class DraftConfirmRequest
-{
-    public string SessionId { get; set; } = string.Empty;
-    public MdrDraft? Corrections { get; set; }
-}
-
-public sealed class DraftResult
-{
-    public string SessionId { get; init; } = string.Empty;
-    public DraftStatus Status { get; init; }
-    public string CompletionState { get; init; } = "partial";
-    public string CurrentStep { get; init; } = "extraction";
-    public string? PendingField { get; init; }
-    public string? NextQuestion { get; init; }
-    public IReadOnlyList<string> MissingFields { get; init; } = [];
-    public MdrDraft Draft { get; init; } = new();
-
-    public static DraftResult FromSession(DraftSession session, IReadOnlyList<string> missingFields, string? nextQuestion)
-    {
-        return new DraftResult
-        {
-            SessionId = session.SessionId,
-            Status = session.Status,
-            CompletionState = session.CompletionState,
-            CurrentStep = session.CurrentStep,
-            PendingField = session.PendingField,
-            NextQuestion = nextQuestion,
-            MissingFields = missingFields,
-            Draft = session.Draft
-        };
-    }
-}
-
-public sealed class DraftSession
-{
-    public string SessionId { get; set; } = string.Empty;
-    public string UserId { get; set; } = string.Empty;
-    public DraftStatus Status { get; set; } = DraftStatus.Started;
-    public string CompletionState { get; set; } = "partial";
-    public string CurrentStep { get; set; } = "extraction";
-    public string? PendingField { get; set; }
-    public MdrDraft Draft { get; set; } = new();
-    public HashSet<string> SkippedFields { get; set; } = [];
-    public DateTimeOffset CreatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
-    public DateTimeOffset UpdatedAtUtc { get; set; } = DateTimeOffset.UtcNow;
-
-    public static DraftSession CreateNew(string sessionId, string userId)
-    {
-        return new DraftSession
-        {
-            SessionId = sessionId,
-            UserId = userId,
-            Status = DraftStatus.Started,
-            CompletionState = "partial",
-            CurrentStep = "extraction",
-            Draft = new MdrDraft { Status = "draft" }
-        };
-    }
-}
+// --- Helpers ---
 
 public sealed class MdrDraft
 {
@@ -677,9 +506,38 @@ public sealed class SqlSessionStore : ISessionStore
     }
 }
 
-public sealed class FoundrySettings
+static string? ResolvePromptsDirectory()
 {
-    public string Endpoint { get; set; } = string.Empty;
-    public string Model { get; set; } = string.Empty;
-    public string AgentName { get; set; } = "mdr-text-extraction-agent";
+    var candidates = new[]
+    {
+        Path.Combine(Directory.GetCurrentDirectory(), "src", "prompts"),
+        Path.Combine(Directory.GetCurrentDirectory(), "src", "ComplianceAgent.Backend", "prompts"),
+        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "src", "prompts")),
+        Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "src", "ComplianceAgent.Backend", "prompts")),
+        Path.Combine(AppContext.BaseDirectory, "prompts")
+    };
+
+    return candidates.FirstOrDefault(Directory.Exists);
+}
+
+static async Task<string> LoadPromptTextAsync(string fileName, string fallback)
+{
+    var promptsDir = ResolvePromptsDirectory();
+    if (!string.IsNullOrWhiteSpace(promptsDir))
+    {
+        var filePath = Path.Combine(promptsDir, fileName);
+        if (File.Exists(filePath))
+        {
+            return await File.ReadAllTextAsync(filePath);
+        }
+    }
+
+    Console.WriteLine($"Prompt file '{fileName}' not found. Using built-in default template.");
+    return fallback;
+}
+
+public class BackendSettings
+{
+    public FoundrySettings Foundry { get; set; } = new();
+    public string InputFile { get; set; } = "data\\Output.json";
 }
